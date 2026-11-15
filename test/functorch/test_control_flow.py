@@ -3054,27 +3054,34 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @parametrize("output", ["tensor", "none"])
     @parametrize("use_cpp", [False, True])
-    def test_scan_xs_none_length_zero(self, output, use_cpp):
+    @parametrize("tracing_mode", [None, "fake", "symbolic"])
+    def test_scan_xs_none_length_zero(self, output, use_cpp, tracing_mode):
         if output == "tensor":
 
             def body(c, x):
                 return c, (c * 2).clone()
 
             init = torch.tensor([1.0, 2.0, 3.0])
-            with torch._dynamo.config.patch(use_cpp_fake_tensor=use_cpp):
-                carry, ys = scan(body, init, None, length=0)
-            self.assertEqual(carry, init)
-            self.assertEqual(ys.shape, torch.Size([0, 3]))
-            self.assertEqual(ys.dtype, init.dtype)
         else:
 
             def body(c, x):  # noqa: E306
                 return c + 1.0, None
 
             init = torch.tensor(0.0)
-            with torch._dynamo.config.patch(use_cpp_fake_tensor=use_cpp):
-                carry, ys = scan(body, init, None, length=0)
-            self.assertEqual(carry, init)
+
+        def fn(init):
+            return scan(body, init, None, length=0)
+
+        with torch._dynamo.config.patch(use_cpp_fake_tensor=use_cpp):
+            traced = (
+                make_fx(fn, tracing_mode=tracing_mode)(init) if tracing_mode else fn
+            )
+            carry, ys = traced(init)
+        self.assertEqual(carry, init)
+        if output == "tensor":
+            self.assertEqual(ys.shape, torch.Size([0, 3]))
+            self.assertEqual(ys.dtype, init.dtype)
+        else:
             self.assertIsNone(ys)
         expected = _fake_scan(body, init, None, length=0)
         self.assertEqual((carry, ys), expected)
