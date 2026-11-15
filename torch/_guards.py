@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     import dis
     from collections.abc import Callable, Generator, Iterator
-    from types import CodeType
+    from types import CodeType, FunctionType
 
     import sympy
 
@@ -932,6 +932,9 @@ class InvokeSubgraphReuseEntry:
     # stamp_out_subgraph uses this to return only the user-visible slice.
     num_user_outputs: int = 0
 
+    # (SymPy predicate, size_oblivious) from shape guards, finite ranges, and deferred asserts.
+    shape_guards: list[tuple[Any, bool]] = dataclasses.field(default_factory=list)
+
 
 @dataclass
 class InvokeSubgraphReuseCondition:
@@ -950,6 +953,9 @@ class InvokeSubgraphReuseCondition:
     # handler is a pre-resolved GuardCheckSpec from GUARD_VALUE_DISPATCH.
     guards: list[tuple[Source, GuardCheckSpec, object, Guard]]
 
+    # Structural dependencies are shared across candidate checks, not runtime values.
+    guard_dependencies: list[OrderedSet[Source]]
+
     # TreeSpec from pytree.tree_flatten of the (args, kwargs) structure.
     # On cache hit, we verify the new call has the same treespec.
     treespec: pytree.TreeSpec | None = None
@@ -958,6 +964,12 @@ class InvokeSubgraphReuseCondition:
     # On cache hit, we check if any modified VT's source is a base of one
     # of these to detect mutations on captured variables.
     traced_sources: OrderedSet[Source] = dataclasses.field(default_factory=OrderedSet)
+
+    # Order annotations required by guard source chains and additional dependencies.
+    guard_on_key_order: set[Source] = dataclasses.field(default_factory=set)
+    lexical_sources: set[tuple[Source, int]] = dataclasses.field(default_factory=set)
+    tensor_sources: tuple[Source, ...] = ()
+    aliases: tuple[int, ...] = ()
 
 
 class InvokeSubgraphCache(HopSubgraphCache):
@@ -972,10 +984,10 @@ class InvokeSubgraphCache(HopSubgraphCache):
         self.effects_cache: dict[
             str, set
         ] = {}  # Maps identifier -> set of effect types
-        # fn.__code__ → list of (condition, cache_entry) pairs. Walked linearly
+        # Function identity distinguishes closures and globals sharing one code object. Walked linearly
         # on lookup; first matching condition wins.
         self.subgraph_reuse_cache: dict[
-            CodeType,
+            FunctionType | CodeType,
             list[tuple[InvokeSubgraphReuseCondition, InvokeSubgraphReuseEntry]],
         ] = defaultdict(list)
         # fn_code → {hash_key → cache_entry}. Used by user-provided
@@ -1051,7 +1063,7 @@ class InvokeSubgraphCache(HopSubgraphCache):
 
     def add_reuse_entry(
         self,
-        fn_code: CodeType,
+        fn_code: CodeType | FunctionType,
         condition: InvokeSubgraphReuseCondition,
         entry: InvokeSubgraphReuseEntry,
         max_reuse_entries: int = 8,
@@ -1072,7 +1084,7 @@ class InvokeSubgraphCache(HopSubgraphCache):
 
     def find_reuse_entry(
         self,
-        fn_code: CodeType,
+        fn_code: CodeType | FunctionType,
         evaluator: Callable[
             [InvokeSubgraphReuseCondition, InvokeSubgraphReuseEntry], bool
         ],

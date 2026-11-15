@@ -1711,6 +1711,14 @@ class OutputGraph(OutputGraphCommon):
             )
             self.tracers.append(tracer)
             yield tracer
+            # Successful ordinary HOP traces contribute to enclosing reuse conditions.
+            if tracer.parent is not None:
+                tracer.parent.traced_sources.update(tracer.traced_sources)
+                tracer.parent.lexical_sources.update(
+                    item
+                    for item in tracer.lexical_sources
+                    if item[1] <= tracer.parent.debug_level
+                )
         finally:
             new_scope_ctx.__exit__(None, None, None)
             self.tracers.pop()
@@ -4284,6 +4292,7 @@ class SubgraphTracer(fx.Tracer):
         # this subtracer's trace. Used by invoke_subgraph reuse to collect
         # guards and detect mutations on captured variables.
         self.traced_sources: OrderedSet[Source] = OrderedSet()
+        self.lexical_sources: set[tuple[Source, int]] = set()
         self.has_builtin_method_identity = False
 
         # True if this tracer is currently tracing (reconstructing) into a Python generator
