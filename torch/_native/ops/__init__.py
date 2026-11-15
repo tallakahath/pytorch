@@ -6,5 +6,6 @@ from . import (
     polar,
     reductions,
     scatter_add,
+    symm_mem_fused,
     topk,
 )
