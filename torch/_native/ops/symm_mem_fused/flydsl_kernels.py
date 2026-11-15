@@ -1,9 +1,9 @@
 # mypy: ignore-errors
-"""FlyDSL gfx950 kernel of the fused all-gather + matmul (flydsl_ag).
+"""FlyDSL gfx950 kernels of the fused all-gather + matmul (flydsl_ag) and matmul + reduce-scatter (flydsl_rs).
 
-fused_hti_kernel is the half-tile-interleaved kernel of torch's vendored FlyDSL GEMM (gemm_hti_gfx950_kernel in
-torch/_inductor/kernel/vendored_templates/flydsl/kernels/gemm_gfx950.py) for bf16, with the op's tile order, waits and
-transfers added.
+Both launch fused_hti_kernel: the half-tile-interleaved kernel of torch's vendored FlyDSL GEMM (gemm_hti_gfx950_kernel
+in torch/_inductor/kernel/vendored_templates/flydsl/kernels/gemm_gfx950.py) for bf16, with each op's tile order, waits
+and transfers added; rs_world, a compile-time constant, picks the op (0: the all-gather).
 
 A and C are addressed from each workgroup's own tile (_rebased): the stock kernel's descriptors at the tensors' bases
 take a 32-bit offset per lane, and C's is sized cosize * 2 truncated to 32 bits, so an A or C of 4 GiB or more would
@@ -19,7 +19,7 @@ hanging.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import arith, llvm, rocdl as rocdl_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -40,6 +40,7 @@ from torch._inductor.kernel.vendored_templates.flydsl.kernels.gemm_gfx950 import
 
 
 _COPY_UNROLL = 4  # AG copy blocks: 16-byte loads in flight per thread
+_REDUCE_UNROLL = 2  # RS reducers: 16-byte vectors per source per thread per item
 
 
 def _global_i32_ptr(addr_i64):
@@ -95,6 +96,66 @@ def _store16(addr_i64, v):
     llvm.store(v, _global_i32_ptr(addr_i64).llvm_ptr, alignment=16)
 
 
+def _bf16x8():
+    return ir.VectorType.get([8], ir.BF16Type.get())
+
+
+def _f32x8():
+    return ir.VectorType.get([8], ir.F32Type.get())
+
+
+def _load_bf16x8(addr_i64):
+    return llvm.load(_bf16x8(), _global_i32_ptr(addr_i64).llvm_ptr, alignment=16)
+
+
+def _ext_f32x8(v):
+    return llvm.FPExtOp(_f32x8(), v).result
+
+
+def _add_f32x8(x, y):
+    return llvm.FAddOp(x, y).result
+
+
+def _trunc_bf16x8(v):
+    return llvm.FPTruncOp(_bf16x8(), v).result
+
+
+# Buffer loads with an explicit cache policy (plain LLVM loads can't carry sc0 / sc1 / nt; volatile adds a vmcnt(0)
+# wait per load). The resource spans 4 GiB from the base, so offsets are raw bytes below 2^32.
+def _brsrc(addr_i64):
+    i16 = ir.IntegerType.get_signless(16)
+    return rocdl_dialect.MakeBufferRsrcOp(
+        ir.Type.parse("!llvm.ptr<8>"),
+        llvm.IntToPtrOp(
+            ir.Type.parse("!llvm.ptr"), fx.Int64(addr_i64).ir_value()
+        ).result,
+        arith.ConstantOp(i16, ir.IntegerAttr.get(i16, 0)).result,
+        fx.Int64(0xFFFFFFFF).ir_value(),
+        fx.Int32(0x20070).ir_value(),
+    ).result
+
+
+def _bload_v4(rsrc, off_i64, cm):
+    off = arith.TruncIOp(
+        ir.IntegerType.get_signless(32), fx.Int64(off_i64).ir_value()
+    ).result
+    return rocdl_dialect.RawPtrBufferLoadOp(
+        ir.VectorType.get([4], T.i32),
+        rsrc,
+        off,
+        fx.Int32(0).ir_value(),
+        aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cm),
+    ).result
+
+
+def _load_source(srcs, rsrcs, p, off, w_off):
+    """16 bytes of source p's chunk: a buffer load with sc1 through its descriptor if there are descriptors, else a
+    global load."""
+    if rsrcs:
+        return llvm.bitcast(_bf16x8(), _bload_v4(rsrcs[p], off + w_off, 16))
+    return _load_bf16x8(srcs[p] + off + w_off)
+
+
 def _rebased(t, row0, col0):
     """t viewed from its element (row0, col0): the same layout on a base address computed in 64 bits."""
     rows = fx.Int64(row0) * fx.Int64(fx.get_scalar(t.stride[0]))
@@ -118,23 +179,28 @@ def fused_hti_kernel(
     comm,
     tiled_mma: fx.TiledMma,
     param: GemmGfx950Param,
+    rs_world: fx.Constexpr[int],
 ):
-    """out = a @ b (bias unused) in all-gather tile order; comm = (arg_flags, arg_ep, i32_mult, flag_stride, rank,
-    world, nsub, arg_ptrs, arg_gat, kc, shard_b, ch_b)."""
-    (
-        arg_flags,
-        arg_ep,
-        i32_mult,
-        flag_stride,
-        rank,
-        world,
-        nsub,
-        arg_ptrs,
-        arg_gat,
-        kc,
-        shard_b,
-        ch_b,
-    ) = comm
+    """out = a @ b (bias unused) in the op's tile order. rs_world 0: the all-gather, comm = (arg_flags, arg_ep,
+    i32_mult, flag_stride, rank, world, nsub, arg_ptrs, arg_gat, kc, shard_b, ch_b); else the reduce-scatter at TP
+    rs_world, comm = (arg_ptrs, arg_cnt_off, arg_ep, arg_out, rank, nred, nb, rpb, lm)."""
+    if const_expr(rs_world == 0):
+        (
+            arg_flags,
+            arg_ep,
+            i32_mult,
+            flag_stride,
+            rank,
+            world,
+            nsub,
+            arg_ptrs,
+            arg_gat,
+            kc,
+            shard_b,
+            ch_b,
+        ) = comm
+    else:
+        arg_ptrs, arg_cnt_off, arg_ep, arg_out, rank, nred, nb, rpb, lm = comm
     operand_fragment_dtype = _operand_fragment_dtype(param)
     cshuffle_dtype = fx.BFloat16
     block_m = param.block_m
@@ -153,103 +219,135 @@ def fused_hti_kernel(
     wid = tid // GFX950_WAVE_SIZE
     num_pid_m = (m - 1) // block_m + 1
     num_pid_n = (n - 1) // block_n + 1
-    # Blocks [0, kc) first pull a peer's shard into the gathered A (kc / (world - 1) blocks per peer, peer
-    # (rank + 1 + w % (world - 1)) % world, chunk by chunk, each chunk striped over the group in steps of
-    # block_threads * 16 B * _COPY_UNROLL), then compute their own tile like every other block. Copy blocks never
-    # wait on a GEMM tile and are the lowest block ids, so they are resident first and are saved and restored
-    # with the kernel. After its stripe of chunk j a block releases (workgroup fence, barrier, thread 0: agent
-    # fence) and adds 1 to flags[peer, j]: chunk j of call e is in once the flag reads e * kc / (world - 1). The
-    # source is half e & 1 of the peer's symmetric buffer (arg_ptrs: the peers' buffer addresses); a
-    # system-scope acquire first drops this XCD's stale lines of it. The host's barrier before the launch orders
-    # the peers' staging before these loads.
-    if fx.block_idx.x < kc:
-        cq = fx.block_idx.x % (world - 1)
-        ci = fx.block_idx.x // (world - 1)
-        cs = kc // (world - 1)
-        cp = (rank + 1 + cq) % world
-        ce = _flag_load(arg_ep)
-        csrc = (
-            _load_i64(arg_ptrs + fx.Int64(cp) * fx.Int64(8))
-            + fx.Int64(ce & 1) * shard_b
+    if const_expr(rs_world == 0):
+        # Blocks [0, kc) first pull a peer's shard into the gathered A (kc / (world - 1) blocks per peer, peer
+        # (rank + 1 + w % (world - 1)) % world, chunk by chunk, each chunk striped over the group in steps of
+        # block_threads * 16 B * _COPY_UNROLL), then compute their own tile like every other block. Copy blocks never
+        # wait on a GEMM tile and are the lowest block ids, so they are resident first and are saved and restored
+        # with the kernel. After its stripe of chunk j a block releases (workgroup fence, barrier, thread 0: agent
+        # fence) and adds 1 to flags[peer, j]: chunk j of call e is in once the flag reads e * kc / (world - 1). The
+        # source is half e & 1 of the peer's symmetric buffer (arg_ptrs: the peers' buffer addresses); a
+        # system-scope acquire first drops this XCD's stale lines of it. The host's barrier before the launch orders
+        # the peers' staging before these loads.
+        if fx.block_idx.x < kc:
+            cq = fx.block_idx.x % (world - 1)
+            ci = fx.block_idx.x // (world - 1)
+            cs = kc // (world - 1)
+            cp = (rank + 1 + cq) % world
+            ce = _flag_load(arg_ep)
+            csrc = (
+                _load_i64(arg_ptrs + fx.Int64(cp) * fx.Int64(8))
+                + fx.Int64(ce & 1) * shard_b
+            )
+            cdst = arg_gat + fx.Int64(cp) * shard_b
+            llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="")
+            vec_bytes = block_threads * 16
+            stripe = vec_bytes * _COPY_UNROLL
+            cj = fx.Int32(0)
+            while cj < nsub:
+                cbase = fx.Int64(cj) * ch_b
+                coff = fx.Int64(ci) * fx.Int64(stripe) + fx.Int64(tid) * fx.Int64(16)
+                while coff < ch_b:
+                    cv = []
+                    for cu in range_constexpr(_COPY_UNROLL):
+                        cv.append(
+                            _load_v4(csrc + cbase + coff + fx.Int64(cu * vec_bytes))
+                        )
+                    for cu in range_constexpr(_COPY_UNROLL):
+                        _store16(cdst + cbase + coff + fx.Int64(cu * vec_bytes), cv[cu])
+                    coff = coff + fx.Int64(cs) * fx.Int64(stripe)
+                llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
+                rocdl.s_barrier()
+                if tid == 0:
+                    llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="agent")
+                    _atomic_add(
+                        arg_flags + fx.Int64(cp * nsub + cj) * fx.Int64(flag_stride),
+                        1,
+                        "agent",
+                    )
+                cj = cj + 1
+        # Tile row v of the block swizzle goes to order position o: the swizzle gives XCD x rows [x * R, (x + 1) * R)
+        # (R = num_pid_m / 8, groups of GROUP_M rows), so o = (g * 8 + x) * GROUP_M + r for v = x * R + g * GROUP_M
+        # + r: every XCD walks the order from its start and a group stays on its XCD (needs num_pid_m % (8 * GROUP_M)
+        # == 0 and the swizzle on: at least 256 tiles, a multiple of 8). o < tpr (tile rows per rank): this rank's
+        # rows, no wait; else o - tpr = s * tps * (world - 1) + (j - 1) * tps + i: peer (rank + j) % world,
+        # sub-chunk s, its row s * tps + i.
+        bid_v, bid_n = BlockSwizzle(
+            NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+        ).swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
+        xr = num_pid_m // 8
+        bid_o = (
+            (bid_v % xr) // param.group_m * 8 + bid_v // xr
+        ) * param.group_m + bid_v % param.group_m
+        tpr = num_pid_m // world
+        tps = tpr // nsub
+        o2 = bid_o - tpr
+        per_s = tps * (world - 1)
+        s_sub = o2 // per_s
+        r_sub = o2 % per_s
+        peer = (rank + r_sub // tps + 1) % world
+        bid_m = (bid_o < tpr).select(
+            rank * tpr + bid_o, peer * tpr + s_sub * tps + r_sub % tps
         )
-        cdst = arg_gat + fx.Int64(cp) * shard_b
-        llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="")
-        vec_bytes = block_threads * 16
-        stripe = vec_bytes * _COPY_UNROLL
-        cj = fx.Int32(0)
-        while cj < nsub:
-            cbase = fx.Int64(cj) * ch_b
-            coff = fx.Int64(ci) * fx.Int64(stripe) + fx.Int64(tid) * fx.Int64(16)
-            while coff < ch_b:
-                cv = []
-                for cu in range_constexpr(_COPY_UNROLL):
-                    cv.append(_load_v4(csrc + cbase + coff + fx.Int64(cu * vec_bytes)))
-                for cu in range_constexpr(_COPY_UNROLL):
-                    _store16(cdst + cbase + coff + fx.Int64(cu * vec_bytes), cv[cu])
-                coff = coff + fx.Int64(cs) * fx.Int64(stripe)
-            llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="workgroup")
+        # A peer tile's thread 0 polls flags[peer * nsub + s] (flag_stride bytes apart) until it reaches epoch *
+        # i32_mult, the epoch being the int32 at arg_ep (the device's, so a replayed graph stays in step), then an
+        # agent-scope acquire; a barrier and a workgroup-scope acquire in every thread before the first A load.
+        if bid_o >= tpr:
+            flag_addr = arg_flags + fx.Int64(peer * nsub + s_sub) * fx.Int64(
+                flag_stride
+            )
+            if fx.thread_idx.x == 0:
+                tgt = _flag_load(arg_ep) * i32_mult
+                if _flag_load(flag_addr) - tgt < 0:
+                    w0 = _rt()
+                    wms = _flag_load(arg_ep + fx.Int64(8))
+                    while _flag_load(flag_addr) - tgt < 0:
+                        rocdl.s_sleep(1)
+                        if _rt() - w0 > fx.Int64(wms) * fx.Int64(100000):
+                            if _atomic_add(arg_ep + fx.Int64(4), 1, "agent") == 0:
+                                fx.printf(
+                                    "[FATAL] fly_agmm: rank {} block {} waited {} ms for chunk {} of peer rank {} "
+                                    "(flag {}, target {}, epoch {})\n",
+                                    rank,
+                                    fx.block_idx.x,
+                                    wms,
+                                    s_sub,
+                                    peer,
+                                    _flag_load(flag_addr),
+                                    tgt,
+                                    _flag_load(arg_ep),
+                                )
+                            llvm.intr_trap()
+                llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="agent")
             rocdl.s_barrier()
-            if tid == 0:
-                llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="agent")
-                _atomic_add(
-                    arg_flags + fx.Int64(cp * nsub + cj) * fx.Int64(flag_stride),
-                    1,
-                    "agent",
-                )
-            cj = cj + 1
-    # Tile row v of the block swizzle goes to order position o: the swizzle gives XCD x rows [x * R, (x + 1) * R)
-    # (R = num_pid_m / 8, groups of GROUP_M rows), so o = (g * 8 + x) * GROUP_M + r for v = x * R + g * GROUP_M
-    # + r: every XCD walks the order from its start and a group stays on its XCD (needs num_pid_m % (8 * GROUP_M)
-    # == 0 and the swizzle on: at least 256 tiles, a multiple of 8). o < tpr (tile rows per rank): this rank's
-    # rows, no wait; else o - tpr = s * tps * (world - 1) + (j - 1) * tps + i: peer (rank + j) % world,
-    # sub-chunk s, its row s * tps + i.
-    bid_v, bid_n = BlockSwizzle(
-        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
-    ).swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    xr = num_pid_m // 8
-    bid_o = (
-        (bid_v % xr) // param.group_m * 8 + bid_v // xr
-    ) * param.group_m + bid_v % param.group_m
-    tpr = num_pid_m // world
-    tps = tpr // nsub
-    o2 = bid_o - tpr
-    per_s = tps * (world - 1)
-    s_sub = o2 // per_s
-    r_sub = o2 % per_s
-    peer = (rank + r_sub // tps + 1) % world
-    bid_m = (bid_o < tpr).select(
-        rank * tpr + bid_o, peer * tpr + s_sub * tps + r_sub % tps
-    )
-    # A peer tile's thread 0 polls flags[peer * nsub + s] (flag_stride bytes apart) until it reaches epoch *
-    # i32_mult, the epoch being the int32 at arg_ep (the device's, so a replayed graph stays in step), then an
-    # agent-scope acquire; a barrier and a workgroup-scope acquire in every thread before the first A load.
-    if bid_o >= tpr:
-        flag_addr = arg_flags + fx.Int64(peer * nsub + s_sub) * fx.Int64(flag_stride)
-        if fx.thread_idx.x == 0:
-            tgt = _flag_load(arg_ep) * i32_mult
-            if _flag_load(flag_addr) - tgt < 0:
-                w0 = _rt()
-                wms = _flag_load(arg_ep + fx.Int64(8))
-                while _flag_load(flag_addr) - tgt < 0:
-                    rocdl.s_sleep(1)
-                    if _rt() - w0 > fx.Int64(wms) * fx.Int64(100000):
-                        if _atomic_add(arg_ep + fx.Int64(4), 1, "agent") == 0:
-                            fx.printf(
-                                "[FATAL] fly_agmm: rank {} block {} waited {} ms for chunk {} of peer rank {} "
-                                "(flag {}, target {}, epoch {})\n",
-                                rank,
-                                fx.block_idx.x,
-                                wms,
-                                s_sub,
-                                peer,
-                                _flag_load(flag_addr),
-                                tgt,
-                                _flag_load(arg_ep),
-                            )
-                        llvm.intr_trap()
-            llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="agent")
-        rocdl.s_barrier()
-        llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+            llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    else:
+        # Rank r's partial C_r = A_r B_r [M, N] goes to its symmetric staging buffer (`out`); chunk c (rows
+        # [c lm, (c + 1) lm)) belongs to rank c. Order: step s = band s (rpb tile rows) of every chunk, chunks
+        # (rank + 1 + q) % world for q = 0..world - 1 (the own chunk last); rs_g tiles per chunk band. XCD x =
+        # block id % 8 takes 1/8 of each step in turn: at TP 8 a 4-row x (tile columns / 4) block of the step's 8
+        # tile rows, column by column, so its resident tiles share A and B slices as the stock GROUP_M 4 swizzle
+        # does (needs world * rpb == 8); at TP 4 / 2, 1/8 of the step in order.
+        rs_g = rpb * num_pid_n
+        rs_x = fx.block_idx.x % 8
+        rs_j = fx.block_idx.x // 8
+        rs_t = rs_world * rs_g // 8
+        if const_expr(rs_world == 8):
+            rs_s = rs_j // rs_t
+            rs_l = rs_j % rs_t
+            rs_nrg = rs_world * rpb // 4
+            rs_qr = rs_x % rs_nrg * 4 + rs_l % 4
+            rs_c = (rank + 1 + rs_qr // rpb) % rs_world
+            bid_m = rs_c * (lm // block_m) + rs_s * rpb + rs_qr % rpb
+            bid_n = rs_x // rs_nrg * (rs_t // 4) + rs_l // 4
+        else:
+            rs_o = (rs_j // rs_t * 8 + rs_x) * rs_t + rs_j % rs_t
+            rs_s = rs_o // (rs_world * rs_g)
+            rs_q = rs_o % (rs_world * rs_g)
+            rs_c = (rank + 1 + rs_q // rs_g) % rs_world
+            rs_u = rs_q % rs_g
+            bid_m = rs_c * (lm // block_m) + rs_s * rpb + rs_u % rpb
+            bid_n = rs_u // rpb
     k_tiles = (k - 1) // block_k + 1
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
@@ -413,7 +511,11 @@ def fused_hti_kernel(
         rocdl.sched_barrier(0)
 
     cshuffle_s2r_atom = fx.make_copy_atom(fx.UniversalCopy128b(), cshuffle_dtype)
-    cshuffle_r2g_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), cshuffle_dtype)
+    # The RS stores write through (cache policy 17: sc0 | sc1), so the system-scope release before each tile's
+    # counter add finds no dirty lines to write back.
+    cshuffle_r2g_atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy128b(17 if rs_world else 0), cshuffle_dtype
+    )
 
     def cshuffle_views():
         sC = fx.make_view(
@@ -607,8 +709,101 @@ def fused_hti_kernel(
     store_half_tile(1, 0, c10)
     store_half_tile(1, 1, c11)
 
+    if const_expr(rs_world):
+        # Once every wave's stores are acknowledged, thread 0 releases at system scope and adds 1 to the owner's
+        # counter (band s, this rank; a band's world counters share one 128-byte line). Band s of chunk c is in from
+        # every source once each of its counters has reached epoch * rs_g. The host's barrier before each launch
+        # orders every peer's reads of the previous call's staging before these stores, so GEMM tiles never wait
+        # and the reducers below cannot deadlock.
+        __barrier(0)
+        if tid == 0:
+            llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="")
+            rs_owner = _load_i64(arg_ptrs + fx.Int64(rs_c) * fx.Int64(8))
+            _atomic_add(
+                rs_owner + arg_cnt_off + fx.Int64(rs_s * 32 + rank) * fx.Int64(4), 1, ""
+            )
+        # Blocks [0, nred) then reduce this rank's chunk band by band: thread 0 polls the band's counters, then a
+        # system-scope acquire, the barrier and a workgroup-scope acquire; items of block_threads * 8 *
+        # _REDUCE_UNROLL elements, item i to reducer i % nred: every source's 16-byte vectors loaded, summed in fp32 in
+        # rank order 0..world - 1, rounded once, stored to arg_out. Each source's chunk is addressed from its own
+        # 64-bit base; at TP 8 through one descriptor per chunk (lm x N must stay below 4 GiB) with sc1 loads.
+        if fx.block_idx.x < nred:
+            rs_cnt = _load_i64(arg_ptrs + fx.Int64(rank) * fx.Int64(8)) + arg_cnt_off
+            rs_tgt = _flag_load(arg_ep) * rs_g
+            rs_src = []
+            for rs_p in range_constexpr(rs_world):
+                rs_src.append(
+                    _load_i64(arg_ptrs + fx.Int64(rs_p * 8))
+                    + fx.Int64(rank) * fx.Int64(lm) * fx.Int64(n) * fx.Int64(2)
+                )
+            rs_rsrc = []
+            if const_expr(rs_world == 8):
+                for rs_p in range_constexpr(rs_world):
+                    rs_rsrc.append(_brsrc(rs_src[rs_p]))
+            rs_item = block_threads * 8 * _REDUCE_UNROLL
+            rs_ipb = rpb * block_m * n // rs_item
+            vec_bytes = block_threads * 16
+            rs_fatal = (
+                f"[FATAL] fly_rsmm TP{rs_world}: rank {{}} reducer block {{}} waited {{}} ms for band {{}} from "
+                "source rank {} (counter {}, target {}, epoch {})\n"
+            )
+            rs_band = fx.Int32(0)
+            while rs_band < nb:
+                if tid == 0:
+                    rs_wp = fx.Int32(0)
+                    while rs_wp < rs_world:
+                        rs_ca = rs_cnt + fx.Int64(rs_band * 32 + rs_wp) * fx.Int64(4)
+                        if _flag_load(rs_ca) - rs_tgt < 0:
+                            rs_w0 = _rt()
+                            rs_ms = _flag_load(arg_ep + fx.Int64(8))
+                            while _flag_load(rs_ca) - rs_tgt < 0:
+                                rocdl.s_sleep(1)
+                                if _rt() - rs_w0 > fx.Int64(rs_ms) * fx.Int64(100000):
+                                    if (
+                                        _atomic_add(arg_ep + fx.Int64(4), 1, "agent")
+                                        == 0
+                                    ):
+                                        fx.printf(
+                                            rs_fatal,
+                                            rank,
+                                            fx.block_idx.x,
+                                            rs_ms,
+                                            rs_band,
+                                            rs_wp,
+                                            _flag_load(rs_ca),
+                                            rs_tgt,
+                                            _flag_load(arg_ep),
+                                        )
+                                    llvm.intr_trap()
+                        rs_wp = rs_wp + 1
+                    llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="")
+                rocdl.s_barrier()
+                llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+                rs_i0 = rs_band * rs_ipb
+                rs_i = rs_i0 + ((fx.block_idx.x - rs_i0) % nred + nred) % nred
+                while rs_i < rs_i0 + rs_ipb:
+                    rs_row = fx.Int64(rs_i) * fx.Int64(rs_item * 2)
+                    rs_off = rs_row + fx.Int64(tid) * fx.Int64(16)
+                    rs_v = []
+                    for rs_p in range_constexpr(rs_world):
+                        for rs_w in range_constexpr(_REDUCE_UNROLL):
+                            rs_w_off = fx.Int64(rs_w * vec_bytes)
+                            rs_v.append(
+                                _load_source(rs_src, rs_rsrc, rs_p, rs_off, rs_w_off)
+                            )
+                    for rs_w in range_constexpr(_REDUCE_UNROLL):
+                        rs_acc = _ext_f32x8(rs_v[rs_w])
+                        for rs_p in range_constexpr(1, rs_world):
+                            rs_acc = _add_f32x8(
+                                rs_acc, _ext_f32x8(rs_v[rs_p * _REDUCE_UNROLL + rs_w])
+                            )
+                        rs_dst = arg_out + rs_off + fx.Int64(rs_w * vec_bytes)
+                        _store16(rs_dst, _trunc_bf16x8(rs_acc))
+                    rs_i = rs_i + nred
+                rs_band = rs_band + 1
 
-def _launch(out, a, b, comm, param, stream, name):
+
+def _launch(out, a, b, comm, param, stream, rs_world, name):
     m = fx.Int32(fx.get_scalar(a.shape[0]))
     n = fx.Int32(fx.get_scalar(b.shape[1]))
     k = fx.Int32(fx.get_scalar(a.shape[1]))
@@ -636,6 +831,7 @@ def _launch(out, a, b, comm, param, stream, name):
         comm,
         tiled_mma,
         param,
+        rs_world,
     ).launch(
         grid=(num_pid_m * num_pid_n, 1, 1),
         block=(param.block_threads, 1, 1),
@@ -679,4 +875,28 @@ def agmm_gfx950(
         shard_b,
         ch_b,
     )
-    _launch(out, a, b, comm, param, stream, "agmm_")
+    _launch(out, a, b, comm, param, stream, 0, "agmm_")
+
+
+@flyc.jit
+def rsmm_gfx950(
+    stage: fx.Tensor,
+    a: fx.Tensor,
+    b: fx.Tensor,
+    arg_ptrs: fx.Int64,
+    arg_cnt_off: fx.Int64,
+    arg_ep: fx.Int64,
+    arg_out: fx.Int64,
+    rank: fx.Int32,
+    world: fx.Constexpr[int],
+    nred: fx.Int32,
+    nb: fx.Int32,
+    rpb: fx.Int32,
+    lm: fx.Int32,
+    param: GemmGfx950Param,
+    stream: fx.Stream = fx.Stream(None),
+):
+    """stage[M, N] = a[M, K] @ b[K, N] in reduce-scatter order; blocks < nred then sum this rank's chunk of every
+    source's stage into arg_out [lm, N]."""
+    comm = (arg_ptrs, arg_cnt_off, arg_ep, arg_out, rank, nred, nb, rpb, lm)
+    _launch(stage, a, b, comm, param, stream, world, f"rsmm_w{world}_")

@@ -1,15 +1,15 @@
-"""FlyDSL override for symm_mem's fused all-gather + matmul (AsyncTP) on gfx950.
+"""FlyDSL overrides for symm_mem's fused all-gather + matmul and matmul + reduce-scatter (AsyncTP) on gfx950.
 
 Opt-in: nothing is registered unless TORCH_SYMM_MEM_FLYDSL=1 is set before `import torch`. A call goes to FlyDSL
-when its predicate admits it (bf16, 2D, one B, gather dim 0, the kernel's tile multiples, TP 2/4/8); anything else
-falls through to the op's own implementation.
+when its predicate admits it (bf16, 2D, one B, gather / scatter dim 0, "sum", the kernels' tile multiples, TP 2/4/8);
+anything else falls through to the op's own implementation.
 
 The predicates read only shapes, strides, dtypes and the group size, so every rank of a group takes the same path:
 the FlyDSL kernels rendezvous on their first call at each shape, and a rank that fell through instead would leave
 the others waiting.
 
-The op is in flydsl_ag.py; its kernel (flydsl_kernels.py) is built on torch's vendored FlyDSL GEMM
-(torch/_inductor/kernel/vendored_templates/flydsl/kernels/gemm_gfx950.py).
+The ops are in flydsl_ag.py / flydsl_rs.py; their kernels (flydsl_kernels.py) are built on torch's vendored FlyDSL
+GEMM (torch/_inductor/kernel/vendored_templates/flydsl/kernels/gemm_gfx950.py).
 """
 
 # mypy: allow-untyped-defs
@@ -58,13 +58,30 @@ def _ag_impl(A_shard, Bs, gather_dim, group_name, *, return_A=True):
     )
 
 
+def _rs_cond(A, B, reduce_op, scatter_dim, group_name) -> bool:
+    if not _on_supported_device(A):
+        return False
+    return (
+        _kernels("flydsl_rs").supported(A, B, reduce_op, scatter_dim, group_name)
+        is not None
+    )
+
+
+def _rs_impl(A, B, reduce_op, scatter_dim, group_name):
+    _calls["rs", "flydsl"] += 1
+    return _kernels("flydsl_rs").run(A, B, reduce_op, scatter_dim, group_name)
+
+
 # The symm_mem ops exist only once `_DEFINING_MODULE` has run; test_override_declarations.py resolves these symbols.
 # Builds without distributed have no such module, so they declare nothing.
 _NAMESPACE = "symm_mem" if torch.distributed.is_available() else None
 _DEFINING_MODULE = "torch.distributed._symmetric_memory"
 
 # (op_symbol, cond, impl) for every override this module installs.
-_OVERRIDES = (("fused_all_gather_matmul", _ag_cond, _ag_impl),)
+_OVERRIDES = (
+    ("fused_all_gather_matmul", _ag_cond, _ag_impl),
+    ("fused_matmul_reduce_scatter", _rs_cond, _rs_impl),
+)
 
 
 def register_flydsl_symm_mem_overrides() -> None:

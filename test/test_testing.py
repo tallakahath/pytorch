@@ -3133,6 +3133,7 @@ class TestImports(TestCase):
                            "torch._native.ops.symm_mem_fused.flydsl_ag",  # depends on flydsl
                            "torch._native.ops.symm_mem_fused.flydsl_common",  # depends on flydsl
                            "torch._native.ops.symm_mem_fused.flydsl_kernels",  # depends on flydsl
+                           "torch._native.ops.symm_mem_fused.flydsl_rs",  # depends on flydsl
                            "torch._native.ops.topk",  # depends on cutlass
                            "torch._inductor.codegen.cuda",  # depends on cutlass
                            "torch._inductor.codegen.cutedsl",  # depends on cutlass

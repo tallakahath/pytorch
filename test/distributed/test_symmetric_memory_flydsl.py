@@ -1,9 +1,9 @@
 # Owner(s): ["oncall: distributed"]
-"""FlyDSL override of symm_mem::fused_all_gather_matmul (torch/_native/ops/symm_mem_fused).
+"""FlyDSL overrides of symm_mem::fused_all_gather_matmul / fused_matmul_reduce_scatter (torch/_native/ops/symm_mem_fused).
 
-TestRegistration needs no GPU. FlyAsyncTPTest follows AsyncTPTest (test_symmetric_memory.py) at shapes the predicate
-admits, checking each call against PyTorch's reference (_fused_all_gather_matmul_fallback), plus calls the predicate
-rejects and the registry's off switch. It needs FlyDSL and gfx950; world size = visible GPUs (2, 4 or 8).
+TestRegistration needs no GPU. FlyAsyncTPTest follows AsyncTPTest (test_symmetric_memory.py) at shapes the predicates
+admit, checking each call against PyTorch's reference (_fused_*_fallback), plus calls the predicates reject and the
+registry's off switch. It needs FlyDSL and gfx950; world size = visible GPUs (2, 4 or 8).
 
   python test/distributed/test_symmetric_memory_flydsl.py
 """
@@ -53,6 +53,18 @@ AG_SHAPES = {
     "k384_n768_col": (8192, 384, 768, "col"),
     "k1152_n1280_row": (16384, 1152, 1280, "row"),
 }
+RS_SHAPES = {
+    "row": {
+        8: (2048, 128, 1024, "row"),
+        4: (4096, 128, 256, "row"),
+        2: (8192, 128, 256, "row"),
+    },
+    "col": {
+        8: (4096, 640, 3072, "col"),
+        4: (8192, 640, 768, "col"),
+        2: (8192, 640, 768, "col"),
+    },
+}
 
 
 def _tol(ref):
@@ -86,7 +98,10 @@ class TestRegistration(TestCase):
 
     @requires_flydsl
     def test_opt_in_registers_without_initializing_cuda(self):
-        self.assertEqual(_probe("1"), "['fused_all_gather_matmul'] False")
+        self.assertEqual(
+            _probe("1"),
+            "['fused_all_gather_matmul', 'fused_matmul_reduce_scatter'] False",
+        )
 
 
 def weight(k, n, lay):
@@ -142,6 +157,14 @@ class FlyAsyncTPTest(MultiProcContinuousTest):
         self._routed("ag", before, flydsl)
         return out
 
+    def _rs(self, A, B, flydsl=True):
+        before = self._calls("rs")
+        out = torch.ops.symm_mem.fused_matmul_reduce_scatter(
+            A, B, "sum", 0, dist.group.WORLD.group_name
+        )
+        self._routed("rs", before, flydsl)
+        return out
+
     def _check_ag(self, A_shard, B, ag, mm, return_A):
         from torch.distributed._symmetric_memory import (
             _fused_all_gather_matmul_fallback,
@@ -162,6 +185,17 @@ class FlyAsyncTPTest(MultiProcContinuousTest):
         torch.testing.assert_close(mm[0], mm0[0], **_tol(mm0[0]))
         self.assertEqual(mm[0].stride(), mm0[0].stride())
 
+    def _check_rs(self, A, B, out):
+        from torch.distributed._symmetric_memory import (
+            _fused_matmul_reduce_scatter_fallback,
+        )
+
+        out0 = _fused_matmul_reduce_scatter_fallback(
+            A, B, "sum", scatter_dim=0, group_name=dist.group.WORLD.group_name
+        )
+        torch.testing.assert_close(out, out0, **_tol(out0))
+        self.assertEqual(out.stride(), out0.stride())
+
     @skip_if_lt_x_gpu(2)
     @parametrize("shape", list(AG_SHAPES))
     @parametrize("return_A", [True, False])
@@ -174,8 +208,17 @@ class FlyAsyncTPTest(MultiProcContinuousTest):
         self._check_ag(A_shard, B, ag, mm, return_A)
 
     @skip_if_lt_x_gpu(2)
+    @parametrize("layout", list(RS_SHAPES))
+    def test_fused_matmul_reduce_scatter(self, layout: str) -> None:
+        self._init_process()
+        m, k, n, lay = RS_SHAPES[layout][self.world_size]
+        A = torch.rand(m, k, dtype=BF, device="cuda")
+        B = weight(k, n, lay)
+        self._check_rs(A, B, self._rs(A, B))
+
+    @skip_if_lt_x_gpu(2)
     def test_rejected_calls_fall_through(self) -> None:
-        """fp32, a K the tiles don't divide, and gather dim 1 go to the op's own implementation."""
+        """fp32, a K the tiles don't divide, and gather / scatter dim 1 go to the op's own implementation."""
         self._init_process()
         m, k, n, lay = AG_SHAPES["k384_n768_col"]
         for A_shard, B in (
@@ -197,11 +240,14 @@ class FlyAsyncTPTest(MultiProcContinuousTest):
             flydsl=False,
             gather_dim=1,
         )
+        m, k, n, lay = RS_SHAPES["col"][self.world_size]
+        A, B = torch.rand(m, k, device="cuda"), torch.rand(k, n, device="cuda")
+        self._check_rs(A, B, self._rs(A, B, flydsl=False))
 
     @skip_if_lt_x_gpu(2)
     def test_32bit_bounds(self) -> None:
         """A gathered A or output of 4 GiB is admitted (both are addressed per tile). Still 32-bit, so rejected at
-        4 GiB: B and the shard."""
+        4 GiB: B (both ops), the AG shard, and the RS output chunk (M / TP x N)."""
         self._init_process()
         from torch._native.ops.symm_mem_fused import flydsl_impl
 
@@ -211,17 +257,30 @@ class FlyAsyncTPTest(MultiProcContinuousTest):
         rows = 2**32 // (2 * n)  # an M x N bf16 output of exactly 4 GiB
         A_shard = torch.empty(rows // w, k, dtype=BF, device="cuda")
         self.assertTrue(flydsl_impl._ag_cond(A_shard, [B], 0, g), "AG, 4 GiB output")
-        del A_shard, B
+        self.assertTrue(
+            flydsl_impl._rs_cond(
+                torch.empty(rows, k, dtype=BF, device="cuda"), B, "sum", 0, g
+            )
+        )
+        A = torch.empty(rows * w, k, dtype=BF, device="cuda")
+        self.assertFalse(
+            flydsl_impl._rs_cond(A, B, "sum", 0, g), "RS, 4 GiB output chunk"
+        )
+        del A_shard, A, B
         # B one tile-aligned step below 4 GiB, then exactly 4 GiB.
         k = 32768
         W = torch.empty(n, k, dtype=BF, device="cuda")
         A_shard = torch.empty(8192 // w, k, dtype=BF, device="cuda")
+        A = torch.empty(8192, k, dtype=BF, device="cuda")
         for cols, admitted in ((n - 1024, True), (n, False)):
             B = W[:cols].t()
             self.assertEqual(
                 flydsl_impl._ag_cond(A_shard, [B], 0, g),
                 admitted,
                 f"AG, B {k} x {cols}",
+            )
+            self.assertEqual(
+                flydsl_impl._rs_cond(A, B, "sum", 0, g), admitted, f"RS, B {k} x {cols}"
             )
 
     @skip_if_lt_x_gpu(2)
@@ -241,6 +300,34 @@ class FlyAsyncTPTest(MultiProcContinuousTest):
             torch._native.registry.reenable_op_overrides(enable_dsl_names="flydsl")
         ag, mm = self._ag(A_shard, B, True)
         self._check_ag(A_shard, B, ag, mm, True)
+
+    @skip_if_lt_x_gpu(2)
+    def test_graph_capture(self) -> None:
+        """One eager call per op builds the states; then both ops in one CUDA graph, replayed with new inputs."""
+        self._init_process()
+        m, k, n, lay = AG_SHAPES["k384_n768_col"]
+        A_shard, Bg = (
+            torch.rand(m // self.world_size, k, dtype=BF, device="cuda"),
+            weight(k, n, lay),
+        )
+        m, k, n, lay = RS_SHAPES["col"][self.world_size]
+        A, Br = torch.rand(m, k, dtype=BF, device="cuda"), weight(k, n, lay)
+        self._ag(A_shard, Bg, True)
+        self._rs(A, Br)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            ag, mm = self._ag(A_shard, Bg, True)
+            out = self._rs(A, Br)
+        for _ in range(2):
+            A_shard.copy_(torch.rand_like(A_shard))
+            A.copy_(torch.rand_like(A))
+            Bg.copy_(torch.rand_like(Bg))
+            Br.copy_(torch.rand_like(Br))
+            graph.replay()
+            torch.cuda.synchronize()
+            self._check_ag(A_shard, Bg, ag, mm, True)
+            self._check_rs(A, Br, out)
 
 
 if __name__ == "__main__":

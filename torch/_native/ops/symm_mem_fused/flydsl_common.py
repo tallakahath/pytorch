@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-"""Pieces of the FlyDSL fused all-gather + matmul (flydsl_ag) state that the other fused ops share.
+"""Pieces shared by the FlyDSL fused all-gather + matmul (flydsl_ag) and matmul + reduce-scatter (flydsl_rs) states.
 
 Imported on first dispatch only (flydsl_impl._kernels): it pulls in flydsl and triton.
 """
@@ -45,8 +45,8 @@ def bump(ep):
 
 
 def wait_ms() -> int:
-    """TORCH_SYMM_MEM_FLYDSL_TIMEOUT_MS (default 60000; 0 = wait forever): how long a fused kernel's tile waits for a
-    peer before it prints a [FATAL] line and traps, and the symmetric-memory barrier's timeout from a
+    """TORCH_SYMM_MEM_FLYDSL_TIMEOUT_MS (default 60000; 0 = wait forever): how long a fused kernel's tile / reducer
+    waits for a peer before it prints a [FATAL] line and traps, and the symmetric-memory barrier's timeout from a
     state's second call on (the first call's peers may still be compiling)."""
     return int(os.environ.get(_TIMEOUT_ENV, "60000"))
 
@@ -61,7 +61,7 @@ def control_block(device):
 
 def order_streams(st):
     """Order this call on state `st` (current device) after the state's previous call: a state's epoch and staging
-    assume in-order calls (one state on two unordered streams hangs the AG); different states are
+    assume in-order calls (one state on two unordered streams hangs the AG and corrupts the RS); different states are
     independent. Under CUDA graph capture nothing is waited on: torch.cuda.graph synchronizes before capture, and a
     capturing stream may not wait on uncaptured work, so within one capture keep a state's calls on one stream."""
     cur = torch.cuda.current_stream()
